@@ -1,0 +1,11 @@
+[Unit]
+Description=Agenda backup diário Adri Workstation
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=20m
+
+[Install]
+WantedBy=timers.target
+
