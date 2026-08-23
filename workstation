@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly PROJECT_NAME="adri-workstation"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/${PROJECT_NAME}"
+readonly ENV_FILE="${STATE_DIR}/.env"
+readonly BACKUP_DIR="${HOME}/Backups/${PROJECT_NAME}"
+readonly COMPOSE_FILE="${SCRIPT_DIR}/compose.yaml"
+
+info() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
+ok() { printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[AVISO]\033[0m %s\n' "$*" >&2; }
+die() { printf '\033[1;31m[ERRO]\033[0m %s\n' "$*" >&2; exit 1; }
+has() { command -v "$1" >/dev/null 2>&1; }
+sudo_keepalive() { sudo -v; while true; do sudo -n true; sleep 50; kill -0 "$$" || exit; done 2>/dev/null & SUDO_PID=$!; trap 'kill "$SUDO_PID" 2>/dev/null || true' EXIT; }
+compose() { docker compose --project-name "$PROJECT_NAME" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
+
+require_mint() {
+  [[ -r /etc/os-release ]] || die "Sistema não identificado."
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  [[ "${ID:-}" == "linuxmint" ]] || die "Este projeto suporta exclusivamente Linux Mint 22.x."
+  [[ "${VERSION_ID:-}" == 22* ]] || die "Versão não suportada: ${VERSION_ID:-desconhecida}. Use Linux Mint 22.x."
+  [[ "$(dpkg --print-architecture)" == "amd64" ]] || die "Arquitetura suportada: amd64."
+}
+
+generate_env() {
+  install -d -m 700 "$STATE_DIR" "$BACKUP_DIR"
+  if [[ ! -f "$ENV_FILE" ]]; then
+    umask 077
+    cat >"$ENV_FILE" <<EOF
+TZ=America/Sao_Paulo
+POSTGRES_PASSWORD=$(openssl rand -hex 32)
+REDIS_PASSWORD=$(openssl rand -hex 32)
+N8N_ENCRYPTION_KEY=$(openssl rand -hex 32)
+WEBUI_SECRET_KEY=$(openssl rand -hex 32)
+EOF
+    chmod 600 "$ENV_FILE"
+    ok "Segredos locais gerados em $ENV_FILE"
+  fi
+}
+
+install_apt_base() {
+  sudo apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg git jq openssl rsync ufw unattended-upgrades smartmontools flatpak python3 python3-pip python3-venv timeshift
+  if ! has node || [[ "$(node --version 2>/dev/null | tr -dc '0-9' | head -c2)" -lt 24 ]]; then
+    curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+  fi
+}
+
+install_docker() {
+  if ! has docker; then
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+    local codename
+    codename="$(. /etc/os-release; printf '%s' "${UBUNTU_CODENAME:-noble}")"
+    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu %s stable\n' "$(dpkg --print-architecture)" "$codename" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+    sudo apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  fi
+  sudo systemctl enable --now docker
+  sudo usermod -aG docker "$USER"
+}
+
+install_desktop_apps() {
+  flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+  local apps=(com.brave.Browser com.visualstudio.code md.obsidian.Obsidian io.dbeaver.DBeaverCommunity)
+  local app
+  for app in "${apps[@]}"; do flatpak install --user -y flathub "$app"; done
+  if ! has tailscale; then
+    curl -fsSL https://tailscale.com/install.sh | sh
+  fi
+  sudo systemctl enable --now tailscaled
+}
+
+configure_system() {
+  sudo ufw default deny incoming
+  sudo ufw default allow outgoing
+  sudo ufw --force enable
+  sudo systemctl enable --now fstrim.timer
+  sudo dpkg-reconfigure -f noninteractive unattended-upgrades
+  sudo install -m 0644 "${SCRIPT_DIR}/systemd/adri-workstation-backup.service" /etc/systemd/system/
+  sudo install -m 0644 "${SCRIPT_DIR}/systemd/adri-workstation-backup.timer" /etc/systemd/system/
+  sudo sed -i "s|@@USER@@|${USER}|g; s|@@PROJECT_DIR@@|${SCRIPT_DIR}|g" /etc/systemd/system/adri-workstation-backup.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now adri-workstation-backup.timer
+}
+
+ensure_docker_access() {
+  has docker || die "Docker não está instalado. Execute: $0 install"
+  docker info >/dev/null 2>&1 || die "Sua sessão ainda não possui acesso ao Docker. Encerre a sessão, entre novamente e execute: $0 start"
+  generate_env
+}
+
+cmd_install() {
+  require_mint
+  has sudo || die "sudo não encontrado."
+  sudo_keepalive
+  install_apt_base
+  install_docker
+  install_desktop_apps
+  generate_env
+  configure_system
+  if docker info >/dev/null 2>&1; then compose pull; compose up -d --remove-orphans; else warn "Entre novamente na sessão e execute '$0 start' para iniciar os serviços."; fi
+  ok "Instalação concluída. Reinicie a sessão para aplicar o grupo Docker."
+}
+
+cmd_start() { ensure_docker_access; compose up -d --remove-orphans; ok "Plataforma iniciada."; }
+cmd_stop() { ensure_docker_access; compose stop; ok "Plataforma parada; dados preservados."; }
+cmd_status() { ensure_docker_access; compose ps; }
+cmd_logs() { ensure_docker_access; compose logs --tail 200 -f "${1:-}"; }
+
+cmd_update() {
+  sudo_keepalive
+  sudo apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y
+  flatpak update --user -y
+  ensure_docker_access
+  compose pull
+  compose up -d --remove-orphans
+  docker image prune -f
+  ok "Sistema e plataforma atualizados."
+}
+
+cmd_backup() {
+  ensure_docker_access
+  umask 077
+  install -d -m 700 "$BACKUP_DIR"
+  local stamp stage archive was_running
+  stamp="$(date +%Y%m%d-%H%M%S)"; stage="$(mktemp -d)"; archive="${BACKUP_DIR}/${PROJECT_NAME}-${stamp}.tar.gz"
+  was_running="$(compose ps -q | wc -l)"
+  compose up -d postgres redis
+  until compose exec -T postgres pg_isready -U n8n -d n8n >/dev/null 2>&1; do sleep 2; done
+  compose exec -T postgres pg_dump -U n8n -d n8n -Fc >"${stage}/postgres.dump" || die "Falha ao exportar PostgreSQL."
+  compose stop n8n redis postgres
+  cp "$ENV_FILE" "${stage}/.env"
+  compose config >"${stage}/compose.resolved.yaml"
+  docker run --rm -v adri-workstation_n8n_data:/source:ro -v "${stage}:/backup" alpine:3.22 tar -C /source -czf /backup/n8n-data.tar.gz .
+  docker run --rm -v adri-workstation_open_webui_data:/source:ro -v "${stage}:/backup" alpine:3.22 tar -C /source -czf /backup/open-webui-data.tar.gz .
+  docker run --rm -v adri-workstation_portainer_data:/source:ro -v "${stage}:/backup" alpine:3.22 tar -C /source -czf /backup/portainer-data.tar.gz .
+  (( was_running > 0 )) && compose up -d
+  (cd "$stage" && sha256sum .env postgres.dump *.tar.gz >SHA256SUMS && tar -czf "$archive" .)
+  find "$BACKUP_DIR" -maxdepth 1 -type f -name "${PROJECT_NAME}-*.tar.gz" -mtime +30 -delete
+  rm -rf -- "$stage"
+  ok "Backup criado e verificado: $archive"
+}
+
+cmd_restore() {
+  local archive="${1:-}" stage
+  [[ -f "$archive" ]] || die "Informe um arquivo de backup válido."
+  ensure_docker_access
+  stage="$(mktemp -d)"
+  tar -xzf "$archive" -C "$stage"
+  (cd "$stage" && sha256sum -c SHA256SUMS) || die "Backup corrompido. Nada foi restaurado."
+  compose down
+  install -m 600 "$stage/.env" "$ENV_FILE"
+  docker volume rm adri-workstation_postgres_data adri-workstation_redis_data >/dev/null 2>&1 || true
+  for item in n8n:n8n-data open_webui:open-webui-data portainer:portainer-data; do
+    local volume="${item%%:*}" file="${item##*:}"
+    docker volume create "adri-workstation_${volume}_data" >/dev/null
+    docker run --rm -v "adri-workstation_${volume}_data:/target" -v "$stage:/backup:ro" alpine:3.22 sh -c "rm -rf /target/* /target/.[!.]* /target/..?* 2>/dev/null || true; tar -C /target -xzf /backup/${file}.tar.gz"
+  done
+  compose up -d postgres redis
+  until compose exec -T postgres pg_isready -U n8n -d n8n >/dev/null 2>&1; do sleep 2; done
+  compose exec -T postgres dropdb -U n8n --if-exists n8n
+  compose exec -T postgres createdb -U n8n n8n
+  compose exec -T postgres pg_restore -U n8n -d n8n --clean --if-exists <"$stage/postgres.dump"
+  compose up -d
+  rm -rf -- "$stage"
+  ok "Restauração concluída: $archive"
+}
+
+cmd_doctor() {
+  local failures=0
+  require_mint
+  for command in docker flatpak git curl openssl; do has "$command" || { warn "$command ausente"; failures=$((failures+1)); }; done
+  [[ -f "$ENV_FILE" ]] || { warn "Arquivo de segredos ausente"; failures=$((failures+1)); }
+  if has docker && docker info >/dev/null 2>&1; then
+    compose config --quiet || failures=$((failures+1))
+    compose ps
+  else warn "Docker indisponível nesta sessão"; failures=$((failures+1)); fi
+  systemctl is-active --quiet fstrim.timer || { warn "fstrim.timer inativo"; failures=$((failures+1)); }
+  systemctl is-active --quiet adri-workstation-backup.timer || { warn "backup diário inativo"; failures=$((failures+1)); }
+  (( failures == 0 )) || die "Diagnóstico encontrou $failures problema(s)."
+  ok "Diagnóstico concluído sem problemas."
+}
+
+usage() { printf 'Uso: %s {install|start|stop|status|update|backup|restore ARQUIVO|logs [SERVIÇO]|doctor}\n' "$0"; }
+main() { local command="${1:-}"; shift || true; case "$command" in install) cmd_install;; start) cmd_start;; stop) cmd_stop;; status) cmd_status;; update) cmd_update;; backup) cmd_backup;; restore) cmd_restore "$@";; logs) cmd_logs "$@";; doctor) cmd_doctor;; *) usage; exit 2;; esac; }
+main "$@"
