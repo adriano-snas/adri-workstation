@@ -67,7 +67,7 @@ install_docker() {
 }
 
 install_desktop_apps() {
-  flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+  flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
   local apps=(com.brave.Browser com.visualstudio.code md.obsidian.Obsidian io.dbeaver.DBeaverCommunity)
   local app
   for app in "${apps[@]}"; do flatpak install --user -y flathub "$app"; done
