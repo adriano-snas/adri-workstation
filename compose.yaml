@@ -40,7 +40,7 @@ services:
 
   n8n:
     <<: *common
-    image: docker.n8n.io/n8nio/n8n:2
+    image: docker.n8n.io/n8nio/n8n:latest
     depends_on:
       postgres:
         condition: service_healthy
